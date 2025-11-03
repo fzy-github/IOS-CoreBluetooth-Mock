@@ -1,0 +1,24 @@
+# CoreBluetoothMock L2CAP Support Analysis
+
+## Repository structure
+- **Core module (`CoreBluetoothMock/`)** – wraps native CoreBluetooth types and implements simulator-friendly mocks. Key pieces include `CBMCentralManagerMock` for central role behavior, the `CBMPeripheralSpec` builder that describes emulated peripherals, `CBMPeripheralMock` which exposes the CoreBluetooth-like API to app code, and the spec delegate protocol that supplies per-device logic.
+- **Documentation (`CoreBluetoothMock/Documentation.docc/`)** – notes unsupported features like L2CAP and describes the public surface area.
+- **Example app (`Example/nRFBlinky/`)** – demonstrates declaring a mock device via the builder and handling ATT reads/writes in a delegate.
+
+## How mock peripherals are created and managed
+1. **Describe the device** – Tests call `CBMPeripheralSpec.simulatePeripheral` to get a builder, chain configuration (advertising data, connectable services, delegate, MTU, etc.), then `build()` to create the spec object.
+2. **Provide behavior** – A `CBMPeripheralSpecDelegate` implementation reacts to simulated GATT operations (connections, service discovery, reads/writes, notification toggles). Defaults exist for unimplemented handlers.
+3. **Register peripherals** – Tests pass the spec list to `CBMCentralManagerMock.simulatePeripherals` before instantiating a mock central manager. That global array drives scanning and connection results.
+4. **Interact via CoreBluetooth-like API** – `CBMCentralManagerMock` produces `CBMPeripheralMock` instances that forward central API calls into the spec/delegate, enqueue callbacks on the requested dispatch queue, and maintain connection state, notification status, and MTU limits.
+5. **Simulate runtime events** – Specs expose helpers (`simulateConnection`, `simulateValueUpdate`, etc.) that notify all central managers via static hooks on `CBMCentralManagerMock`. This mirrors peripheral-driven behavior like disconnections or notifications.
+
+## Present L2CAP gap
+- The public protocol `CBMPeripheral` exposes `openL2CAPChannel`, but `CBMPeripheralMock` simply `fatalError`s and the documentation states L2CAP features are unsupported.
+- Additionally, `CBML2CAPChannel` is type-aliased to `CBL2CAPChannel`, which works on real hardware but prevents supplying a mock implementation because the Apple class cannot be instantiated by the library. The delegate proxy already has closure support for the `didOpen channel` callback, so higher layers are ready once a mock channel exists.
+
+## Potential solutions for adding L2CAP mock support
+1. **Define mockable channel metadata in `CBMPeripheralSpec`** – Extend the builder with optional L2CAP descriptors (PSM identifiers, preferred MTU, security requirements) and keep them on the spec alongside GATT services. Add corresponding hooks so a spec delegate can approve or reject channel requests and react to channel-level events (open success, close, data received). This mirrors the existing delegate flow for ATT operations and keeps per-device behavior encapsulated.
+2. **Introduce a mock `CBML2CAPChannel` implementation** – Replace the current typealias with an abstraction that both native and mock channels can satisfy—for example, a protocol exposing `psm`, `peer`, `inputStream`, and `outputStream`. Add a wrapper that makes `CBL2CAPChannel` conform to that protocol on physical devices, keeping existing API usage intact; and a `CBML2CAPChannelMock` class that builds paired input/output streams (e.g., via `Stream.getBoundStreams` or lightweight subclasses) and forwards writes into the spec delegate while allowing tests to push incoming data into the central-facing `InputStream`.
+3. **Implement channel lifecycle inside `CBMPeripheralMock`** – When `openL2CAPChannel` is called, validate central state (powered on, connected) similar to other operations; look up the requested PSM in the spec, consult the delegate, and create a mock channel if accepted; deliver `peripheral(_:didOpen:channel:error:)` via the central manager’s dispatch queue just like existing callbacks. Add helpers on the spec to simulate peripheral-initiated channel closures or incoming data so tests can mimic real behavior (akin to `simulateValueUpdate`).
+4. **Model channel traffic and lifecycle** – Back the mock channel’s `inputStream`/`outputStream` with `InputStream`/`OutputStream` pairs or custom stream subclasses so tests can read/write packets. Expose helper methods on `CBMPeripheralSpec` (similar to `simulateValueUpdate`) to push data toward the central, close channels intentionally, and notify multiple connected centrals when needed.
+5. **Update samples and docs** – Once the API exists, extend the nRF Blinky example (or add a new fixture) to register a PSM, respond to channel opens, and exchange mock data. Refresh documentation to remove the “not supported” notice and describe the new builder/delegate options so adopters know how to configure L2CAP mocks.
